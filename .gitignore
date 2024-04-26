@@ -6,8 +6,4 @@ build/
 data/
 snp_ids.txt
 test.vcf
-analysis/
-analysis/*
-*.vcf.gz
-*.tbi
-*.vcf
+
