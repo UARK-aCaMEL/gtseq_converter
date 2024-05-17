@@ -1,24 +1,103 @@
 import argparse
 import gzip
-import os
-from collections import Counter
+import logging
+import shutil
+import warnings
+from collections import Counter, defaultdict
 from pathlib import Path
 
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 import pandas as pd
 import pysam
 import seaborn as sns
+from scipy.stats import pearsonr
+
+fontsize = 18
+dpi = 300
+
+# Adjust matplotlib settings globally.
+sizes = {
+    "axes.labelsize": fontsize,
+    "axes.titlesize": fontsize,
+    "axes.spines.right": False,
+    "axes.spines.top": False,
+    "xtick.top": False,
+    "ytick.right": False,
+    "figure.titlesize": fontsize,
+    "figure.labelsize": fontsize,
+    "xtick.labelsize": fontsize,
+    "ytick.labelsize": fontsize,
+    "font.size": fontsize,
+    "legend.fontsize": fontsize,
+    "legend.title_fontsize": fontsize,
+    "legend.frameon": False,
+    "legend.markerscale": 2.0,
+    "figure.dpi": dpi,
+    "savefig.dpi": dpi,
+}
+
+sns.set_context("paper", rc=sizes)
+plt.rcParams.update(sizes)
+mpl.rcParams.update(sizes)
+
+
+def setup_logger(log_file):
+    logger = logging.getLogger()  # Root logger
+    logger.setLevel(logging.INFO)
+
+    # Clear existing handlers
+    logger.handlers = []
+
+    Path(log_file).parents[0].mkdir(parents=True, exist_ok=True)
+
+    # Create handlers
+    file_handler = logging.FileHandler(log_file)
+    stream_handler = logging.StreamHandler()
+
+    # Create formatters and add it to handlers
+    formatter = logging.Formatter(
+        "%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+    )
+    file_handler.setFormatter(formatter)
+    stream_handler.setFormatter(formatter)
+
+    # Add handlers to the logger
+    logger.addHandler(file_handler)
+    logger.addHandler(stream_handler)
 
 
 class GTseqToVCF:
-    def __init__(self, filepath, str2drop=None):
+    def __init__(
+        self, filepath, output_dir, prefix, plot_filetype, str2drop=None, debug=False
+    ):
         self.filepath = filepath
+        self.prefix = prefix
+        self.plt_ft = plot_filetype
+        self.debug = debug
         self.data = None
         self.header = []
         self.vcf_data = []
         self.snp_ids = None
         self.sample_ids = None
         self.header_key = "Sample"
+
+        # Do some handling and preprocessing to prevent errors downstream.
+        if self.plt_ft.startswith("."):
+            self.plt_ft = self.plt_ft.lstrip(".")
+        self.plt_ft = self.plt_ft.lower()
+
+        if not isinstance(self.prefix, str):
+            self.prefix = str(self.prefix)
+
+        # Set up logfile.
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(exist_ok=True, parents=True)
+
+        logpath = output_dir / f"{self.prefix}_logfile.txt"
+
+        setup_logger(logpath)
+        self.logger = logging.getLogger(__name__)
 
         self.metadata_cols = [
             "Raw Reads",
@@ -31,12 +110,15 @@ class GTseqToVCF:
         self.str2drop = str2drop
 
     def load_data(self):
+        self.logger.info("Loading GT-seq CSV file...")
+
         # Load the data
         self.data = pd.read_csv(self.filepath, header=0)
 
         # Remove metadata columns and store in self.metadata
         self.metadata = pd.concat(
-            [self.data.pop(x) for x in self.metadata_cols], axis=1
+            [self.data.pop(x) for x in self.metadata_cols if x in self.metadata_cols],
+            axis=1,
         )
 
         self.data.columns = self.data.columns.str.strip()
@@ -64,9 +146,11 @@ class GTseqToVCF:
                 ]
 
             else:
-                raise TypeError(
-                    f"str2drop must be a list or str, but got: {type(self.str2drop)}"
-                )
+                msg = f"'str2drop' must be a list of strings, but got: {type(self.str2drop)}"
+                self.logger.error(msg)
+                raise TypeError(msg)
+
+        self.logger.info("Successfully loaded GT-seq CSV file!")
 
     def parse_sample_column(self):
         """
@@ -76,6 +160,7 @@ class GTseqToVCF:
         Returns:
             None
         """
+        self.logger.info("Parsing loci and sample data from GT-seq file..")
 
         # Extract 'CHROM' and 'POS' from the column headers\
         chrom_pos_split = [col.split("_", 1) for col in self.data.columns]
@@ -100,7 +185,9 @@ class GTseqToVCF:
 
         # Validate the 'POS' to ensure all values are numeric
         if not self.data.index.get_level_values("POS").str.isnumeric().all():
-            raise ValueError("Non-numeric values found in 'POS' index level.")
+            msg = "Non-numeric values found in 'POS' index level. Try using the '--str2drop' option to remove offending loci."
+            self.logger.error(msg)
+            raise ValueError(msg)
 
         # Define valid allele pairs
         valid_alleles = {
@@ -133,22 +220,31 @@ class GTseqToVCF:
                 .apply(lambda x: x in valid_alleles or x == "00" or x == "0")
                 .all()
             ):
-                raise ValueError(
-                    f"Invalid alleles found in sample {sample}: {self.data[sample].tolist()}"
-                )
+                msg = f"Invalid alleles found in sample {sample}: {self.data[sample].tolist()}"
+                self.logger.error(msg)
+                raise ValueError(msg)
 
         self.data = self.data.T
+
+        if not self.data.empty:
+            self.logger.info("Successfully parsed loci and sample data!")
+        else:
+            msg = "GT-seq data parsing was unsuccessful. Yielded empty pandas DataFrame. Please check the file format."
+            self.logger.error(msg)
+            raise pd.errors.EmptyDataError(msg)
 
     def calculate_ref_alt_alleles(self):
         """
         Calculates the reference (REF) and alternate (ALT) alleles for each SNP across all samples. Assumes the DataFrame has 'CHROM' and 'POS' as a MultiIndex for the columns and the rest of the columns are SNP genotypes.
         """
-        import pandas as pd
-        from collections import Counter
 
-        # Define a helper function to calculate REF and ALT alleles for a series of genotypes
+        self.logger.info("Calculating reference and alternate alleles...")
+
+        # Define a helper function to calculate REF and ALT alleles for a
+        # series of genotypes
         def get_ref_alt(genotypes):
-            # Flatten the genotype pairs, split by any non-allele character, and count occurrences, excluding missing data
+            # Flatten the genotype pairs, split by any non-allele character,
+            # and count occurrences, excluding missing data
 
             allele_counts = Counter(
                 allele
@@ -181,6 +277,8 @@ class GTseqToVCF:
         self.data["REF"] = refs
         self.data["ALT"] = alts
 
+        self.logger.info("Successfully assigned REF and ALT alleles!")
+
     def join_multiindex(self, df, separator="_"):
         """
         Joins the values of a Pandas MultiIndex into one string per row.
@@ -203,7 +301,7 @@ class GTseqToVCF:
         self.data = self.data.T.reset_index()
 
         # Rename columns to reflect that the first column is now 'sample'
-        self.data.rename(columns={"index": self.header_key}, inplace=True)
+        self.data = self.data.rename(columns={"index": self.header_key})
 
         # Extract SNP IDs from the column names
         self.snp_ids = self.data.columns[1:].tolist()
@@ -216,9 +314,17 @@ class GTseqToVCF:
     def create_vcf_header(self):
         # VCF header lines start with '##' and the column header line starts with '#'
 
+        self.logger.info("Creating VCF header...")
+
         self.sample_ids = [
             x.split("_")[-1] for x in self.sample_ids if x.startswith("GTseek")
         ]
+
+        if not self.sample_ids:
+            msg = "Error parsing sampleIDs from GT-seq file."
+            self.logger.error(msg)
+            raise ValueError(msg)
+
         sample_ids = "\t".join(self.sample_ids)
 
         self.header = [
@@ -230,14 +336,20 @@ class GTseqToVCF:
             + sample_ids.strip("\n"),
         ]
 
+        self.logger.info("Successfully created VCF header!")
+
     def format_genotype_data(self):
         """Formats the genotype data for each SNP according to VCF specifications."""
+
+        self.logger.info("Formatting genotype data...")
+
         self.data = self.data.T
         self.data = self.data.iloc[1:, :]
         self.data["ID"] = self.join_multiindex(self.data)
         self.data = self.data.reset_index()
 
-        self.data.columns = ["CHROM", "POS"] + self.sample_ids + ["REF", "ALT", "ID"]
+        cols = ["CHROM", "POS"] + self.sample_ids + ["REF", "ALT", "ID"]
+        self.data.columns = cols
         self.data = self.data.set_index("ID")
 
         # Ensure SNP IDs are sorted properly for consistent output
@@ -263,9 +375,7 @@ class GTseqToVCF:
                     elif allele == alt_allele or allele in "ATCG":
                         formatted_genotype.append("1")
                     else:
-                        formatted_genotype.append(
-                            "."
-                        )  # For missing or unrecognized alleles
+                        formatted_genotype.append(".")  # For missing alleles
 
                 # Join the allele indices with '/' to form the VCF genotype
                 vcf_genotype = "/".join(formatted_genotype)
@@ -292,8 +402,45 @@ class GTseqToVCF:
             # Join the line into a string and append to the VCF data
             self.vcf_data.append("\t".join(vcf_line))
 
+        self.logger.info("Successfully formatted genotype data!")
+
+    def check_allele_flip(self, record1, record2):
+        """Determines if there is an allele flip between two VCF records using allele comparison.
+
+        Args:
+            record1 (pysam.VariantRecord): The first VCF record.
+            record2 (pysam.VariantRecord): The second VCF record.
+
+        Returns:
+            bool: True if there is an allele flip, False otherwise.
+        """
+        if record1.alts is not None:
+            if len(record1.alts) > 1:
+                alts = (record1.alts[0],)
+            else:
+                alts = record1.alts
+            alleles1 = (record1.ref,) + alts
+        else:
+            alleles1 = (record1.ref,) + (None,)
+        if record2.alts is not None:
+            if len(record2.alts) > 1:
+                alts = (record2.alts[0],)
+            else:
+                alts = record2.alts
+            alleles2 = (record2.ref,) + alts
+        else:
+            alleles2 = (record2.ref,) + (None,)
+
+        # Check if alleles1 is a reverse of alleles2
+        ref_flipped = alleles1 == tuple(reversed(alleles2))
+        return ref_flipped
+
     def write_vcf(self, output_filename):
-        with open(output_filename, "w") as vcf_file:
+        vcf_dir = self.output_dir / "vcfs"
+        vcf_dir.mkdir(exist_ok=True, parents=True)
+        pth = vcf_dir / output_filename
+
+        with open(pth, "w") as vcf_file:
             # Write the header lines
             for line in self.header:
                 vcf_file.write(line + "\n")
@@ -306,19 +453,22 @@ class GTseqToVCF:
         Subsets the data by the locus IDs which are the joined CHROM and POS columns.
 
         Raises:
-            ValueError: If snp_ids have not been set before this method is called.
+            AttributeError: If snp_ids have not been set before this method is called.
 
         Returns:
             pandas.DataFrame: A subset of the original DataFrame containing only the rows with index matching the locus IDs in self.snp_ids.
         """
+        self.logger.info("Subsetting loci to GT-seq panel...")
 
         # Ensure that the snp_ids attribute has been populated
         if self.snp_ids is None:
-            raise ValueError("snp_ids must be set before calling subset_by_locus_ids.")
+            msg = "snp_ids must be set before calling subset_by_locus_ids."
+            self.logger.error(msg)
+            raise AttributeError(msg)
 
         # Create a MultiIndex from the CHROM and POS columns if it's not already done
         if not isinstance(self.data.index, pd.MultiIndex):
-            self.data.set_index(["CHROM", "POS"], inplace=True)
+            self.data = self.data.set_index(["CHROM", "POS"])
 
         # Find the intersection of the data's index with the snp_ids
         locus_ids = set(self.join_multiindex(self.data, separator="_"))
@@ -326,6 +476,13 @@ class GTseqToVCF:
 
         # Subset the DataFrame based on the matching locus IDs
         subset_data = self.data.loc[subset_data.index.isin(subset_ids)]
+
+        if subset_data.empty:
+            msg = "Encountered an issue subsetting the VCF data to the GT-seq panel loci. Subsetted DataFrame was empty. Are the loci present in both the VCF and GT-seq files?"
+            self.logger.error(msg)
+            raise pd.errors.EmptyDataError(msg)
+
+        self.logger.info("Successfully subset VCF loci to GT-seq panel!")
 
         return subset_data
 
@@ -345,8 +502,10 @@ class GTseqToVCF:
         """
         vcf_in, vcf_path = self.read_vcf(vcf_path)
 
+        outpth = self.output_dir / "vcfs" / output_filename.name
+
         # Create a new VCF file for the output
-        vcf_out = pysam.VariantFile(output_filename, "w", header=vcf_in.header)
+        vcf_out = pysam.VariantFile(outpth, "w", header=vcf_in.header)
 
         # Read through the VCF file and write only the records with locus IDs in self.snp_ids
         for record in vcf_in:
@@ -361,6 +520,11 @@ class GTseqToVCF:
         vcf_in.close()
         vcf_out.close()
 
+    def is_gzip_file(self, filepath):
+        with open(filepath, "rb") as test_f:
+            # Test if is gzip file (not bgzip).
+            return test_f.read(2) == b"\x1f\x8b"
+
     def read_vcf(self, filepath):
         """
         Open a VCF file using pysam and return the VariantFile object.
@@ -372,31 +536,98 @@ class GTseqToVCF:
             pysam.VariantFile: VariantFile object for the VCF.
         """
         # Make sure that VCF file is tabix indexed.
-
         try:
             self.ensure_tabix_indexed(filepath)
         except OSError as e:
-            if not str(e).startswith("building of index for"):
-                raise e
+            if self.is_gzip_file(filepath):
+                self.logger.warning(
+                    f"Input VCF file {str(filepath)} is GZipped, but BGZip or uncompressed format was expected. Attempting to gunzip."
+                )
+                shutil.copyfile(
+                    filepath, filepath.with_suffix(str(filepath.suffix) + ".gzip")
+                )
+
+                filepath_orig = filepath
+                filepath = filepath.with_name(f"unzip_{str(filepath.name) + '.gzip'}")
+
+                with gzip.open(filepath_orig, "r") as f_in, open(
+                    filepath, "wb"
+                ) as f_out:
+                    shutil.copyfileobj(f_in, f_out)
+                warnings.warn(f"Copied {str(filepath)} to unzip_{str(filepath)}")
+
+            elif "building of index" in str(e):
+                try:
+                    self.logger.warning(
+                        "VCF file is unsorted. Attempting to sort the file and retry tabix indexing."
+                    )
+                    sorted_filepath = self.sort_vcf_file(filepath)
+                    self.ensure_tabix_indexed(sorted_filepath)
+                    filepath = sorted_filepath
+                except OSError as e2:
+                    msg = f"Unknown error encountered when indexing VCF file: {str(e2)}"
+                    self.logger.error(msg)
+                    raise OSError(msg)
+            else:
+                msg = f"Unknown error encountered when indexing VCF file: {str(e)}"
+                self.logger.error(msg)
+                raise OSError(msg)
 
         if not ".gz" in filepath.suffixes:
             filepath = filepath.with_suffix(filepath.suffix + ".gz")
 
         return pysam.VariantFile(filepath), filepath
 
-    def sort_and_write_vcf(self, input_path, output_path):
+    def sort_vcf_file(self, filepath):
+        """
+        Sort a VCF file.
+
+        Args:
+            filepath (str): The file path to the VCF file.
+
+        Returns:
+            Path: The file path to the sorted VCF file.
+        """
+
+        self.logger.warning(
+            f"Saved sorted VCF file to: {str(filepath.with_suffix('.sorted.vcf.gz'))}"
+        )
+        sorted_filepath = filepath.with_suffix(".sorted.vcf.gz")
+
+        with pysam.VariantFile(filepath, "r") as vcf_in, pysam.BGZFile(
+            sorted_filepath, "w"
+        ) as vcf_out:
+            header = vcf_in.header
+            vcf_out.write(str(header).encode())
+
+            records = []
+            for record in vcf_in:
+                records.append(record)
+
+            sorted_records = sorted(records, key=lambda r: (r.contig, r.start))
+
+            for record in sorted_records:
+                vcf_out.write(str(record).encode())
+
+        return sorted_filepath
+
+    def sort_and_write_vcf(self, input_path, output_fn):
         """
         Sorts a VCF file by chromosome and position and writes the sorted file to a new location.
         The input can be either a .vcf or .vcf.gz file, and the output will match the input format.
 
         Args:
             input_path (str): Path to the original unsorted VCF file.
-            output_path (str): Path to write the sorted VCF file.
+            output_fn (str): Filename to write the sorted VCF file. Will be saved to self.output_dir.
         """
         vcf_in, input_path = self.read_vcf(input_path)
+        vcf_dir = self.output_dir / "vcfs"
+        vcf_dir.mkdir(exist_ok=True, parents=True)
+
+        outpth = vcf_dir / output_fn.name
 
         # Create the output VariantFile object with the same header as the input
-        with pysam.VariantFile(output_path, "w", header=vcf_in.header) as vcf_out:
+        with pysam.VariantFile(outpth, "w", header=vcf_in.header) as vcf_out:
             # Sort records by CHROM and POS before writing
             sorted_records = sorted(vcf_in, key=lambda x: (x.chrom, x.pos))
             for record in sorted_records:
@@ -414,19 +645,25 @@ class GTseqToVCF:
             filepath (pathlib.Path): The path to the VCF file. Can be bgzipped or not.
         """
         if not Path(filepath.stem + ".tbi").exists():
-            pysam.tabix_index(str(filepath), preset="vcf", force=True)
-            print(f"Indexed VCF file: {filepath}")
+            pysam.tabix_index(
+                str(filepath), preset="vcf", force=True, keep_original=True
+            )
+            self.logger.info(f"Indexed VCF file: {filepath}")
 
         if ".gz" not in filepath.suffixes:
             return filepath.with_suffix(filepath.suffix + ".gz")
         return filepath
 
-    def preprocess_vcf_files(self, input_vcf):
+    def preprocess_vcf_files(self, input_vcf_fn, is_final_output=False):
         """Pre-processes input VCF files by sorting and indexing them.
 
         Returns:
             pathlib.Path: modified path with ".gz" extension (if file wasn't already compressed).
         """
+        if not is_final_output:
+            input_vcf = self.output_dir / "vcfs" / input_vcf_fn
+        else:
+            input_vcf = input_vcf_fn
 
         if not input_vcf.name.startswith("sorted_"):
             # Prepend prefix to sorted VCF filename.
@@ -435,32 +672,8 @@ class GTseqToVCF:
             sorted_vcf = input_vcf
 
         # Read, sort, and index VCF file
-        self.sort_and_write_vcf(input_path=input_vcf, output_path=sorted_vcf)
+        self.sort_and_write_vcf(input_path=input_vcf, output_fn=sorted_vcf)
         return self.ensure_tabix_indexed(filepath=sorted_vcf)
-
-    def calculate_missing_percentage_for_samples(self, vcf):
-        """
-        Calculate the percentage of missing genotype data for each sample in a VCF file.
-
-        Args:
-            vcf (pysam.VariantFile): VCF file object.
-
-        Returns:
-            dict: A dictionary with sample names as keys and the percentage of missing data as values.
-        """
-        sample_missing_counts = {sample: 0 for sample in vcf.header.samples}
-        total_loci = 0
-
-        for record in vcf:
-            total_loci += 1
-            for sample in vcf.header.samples:
-                if record.samples[sample]["GT"] == (None, None):  # Missing genotype
-                    sample_missing_counts[sample] += 1
-
-        return {
-            sample: (missing_count / total_loci) * 100
-            for sample, missing_count in sample_missing_counts.items()
-        }
 
     def calculate_missing_percentage_for_loci(self, vcf_path):
         """
@@ -488,18 +701,8 @@ class GTseqToVCF:
 
         return loci_missing_counts
 
-    def index_vcf(self, filepath):
-        """
-        Index a VCF file using pysam.
-
-        Args:
-            filepath (str): The file path to the VCF file to be indexed.
-        """
-        pysam.tabix_index(str(filepath), preset="vcf", force=True)
-        print(f"Indexed VCF file: {filepath}")
-
     def merge_vcf_files_with_missing_data_handling(
-        self, vcf1_path, vcf2_path, output_path
+        self, vcf1_path, vcf2_path, output_fn
     ):
         """
         Merge two VCF files by choosing for each locus the genotypes from the file with the least missing data. If a sample is only present in one file, its genotype is still included.
@@ -507,16 +710,19 @@ class GTseqToVCF:
         Args:
             vcf1_path (pathlib.Path): Path to the first VCF file.
             vcf2_path (pathlib.Path): Path to the second VCF file.
-            output_path (pathlib.Path): Path to the output VCF file. Will have ".gz" appended as extension if not already present, and will be sorted, compressed, and indexed.
+            output_fn (pathlib.Path): Filename of the output VCF file. Will have ".gz" appended as extension if not already present, and will be sorted, compressed, and indexed.
         """
-        output_dir = output_path.parent
+        self.logger.info("Merging VCF and GT-seq data...")
+
+        vcf_dir = self.output_dir / "vcfs"
+        vcf_dir.mkdir(exist_ok=True, parents=True)
+        outpth = vcf_dir / output_fn
 
         # Calculate missing data percentages for each locus in both VCFs
         vcf1_missing = self.calculate_missing_percentage_for_loci(vcf1_path)
         vcf2_missing = self.calculate_missing_percentage_for_loci(vcf2_path)
 
-        locus_details = self.calculate_overall_concordance(vcf1_path, vcf2_path)
-        self.plot_overall_discordance(locus_details, output_dir)
+        self.calculate_overall_concordance(vcf1_path, vcf2_path, self.output_dir)
 
         # Read in VCF files
         vcf1, vcf1_path = self.read_vcf(vcf1_path)
@@ -530,7 +736,7 @@ class GTseqToVCF:
         for sample in combined_samples:
             if sample not in vcf1.header.samples:
                 header.add_sample(sample)
-        output_vcf = pysam.VariantFile(output_path, "w", header=header)
+        output_vcf = pysam.VariantFile(outpth, "w", header=header)
 
         # Cache vcf2 records for efficiency
         vcf2_records = {f"{rec.chrom}_{rec.pos}": rec for rec in vcf2.fetch()}
@@ -595,7 +801,8 @@ class GTseqToVCF:
                 ):  # Avoid setting explicitly missing genotypes if not necessary
                     new_record.samples[sample]["GT"] = chosen_gt
                 else:
-                    # Handle explicitly missing data if needed (e.g., set to './.' or leave as default missing)
+                    # Handle explicitly missing data if needed (e.g., set to
+                    # './.' or leave as default missing)
                     pass
 
             # Write the new record after setting all sample genotypes
@@ -603,10 +810,15 @@ class GTseqToVCF:
 
         output_vcf.close()
 
+        self.logger.info("Successfully merged VCF and GT-seq data!")
+
         # Tabix index and sort output vcf file.
-        return self.preprocess_vcf_files(output_path)
+        return self.preprocess_vcf_files(outpth.name)
 
     def find_shared_loci(self, vcf1_path, vcf2_path):
+
+        self.logger.info("Finding shared loci between VCF and GT-seq data...")
+
         vcf1, vcf1_path = self.read_vcf(vcf1_path)
         vcf2, vcf2_path = self.read_vcf(vcf2_path)
 
@@ -619,161 +831,212 @@ class GTseqToVCF:
 
         return [x.split("-") for x in shared_loci]
 
-    def calculate_overall_concordance(self, vcf1_path, vcf2_path):
+    def are_genotypes_concordant(self, gt1, gt2, ref_flipped):
+        """
+        Check if the genotypes are concordant, accounting for possible allele flips and unphased genotypes.
+        """
+        if ref_flipped:
+            # Flip the alleles in gt2 if ref and alt alleles are flipped
+            flipped_gt2 = []
+            for allele in gt2:
+                if allele == 0:
+                    flipped_gt2.append(1)
+                elif allele == 1:
+                    flipped_gt2.append(0)
+                else:
+                    flipped_gt2.append(allele)
+            gt2 = tuple(flipped_gt2)
+
+        # Convert alleles to strings for comparison and handle None values
+        gt1_str = [str(allele) if allele is not None else "." for allele in gt1]
+        gt2_str = [str(allele) if allele is not None else "." for allele in gt2]
+
+        # Sort alleles to handle unphased genotypes
+        gt1_sorted = sorted(gt1_str)
+        gt2_sorted = sorted(gt2_str)
+
+        return gt1_sorted == gt2_sorted
+
+    def calculate_overall_concordance(self, vcf1_path, vcf2_path, output_dir):
+        self.logger.info("Calculating sample and locus concordance...")
+
         vcf1, vcf1_path = self.read_vcf(vcf1_path)
         vcf2, vcf2_path = self.read_vcf(vcf2_path)
 
         shared_loci = self.find_shared_loci(vcf1_path, vcf2_path)
 
-        locus_details = []
+        sample_concordance = defaultdict(
+            lambda: {"concordant": 0, "discordant": 0, "missing": 0}
+        )
+
+        # Get common samples between the two VCF files
+        common_samples = set(vcf1.header.samples) & set(vcf2.header.samples)
 
         for chrom, pos in shared_loci:
             pos = int(pos)
             record1 = next(vcf1.fetch(chrom, pos - 1, pos), None)
             record2 = next(vcf2.fetch(chrom, pos - 1, pos), None)
 
+            if record1 is None or record2 is None:
+                continue
+
             # Check and correct for allele flips
             ref_flipped = self.check_allele_flip(record1, record2)
-
-            # Initialize counts
-            concordant_ref = concordant_alt = discordant = 0
 
             if ref_flipped and record2.alts is not None:
                 # Swap ref and alt in record2 for comparison purposes
                 record2.ref, record2.alts = record2.alts[0], (record2.ref,)
 
-            # Compare REF and ALT alleles
-            if record1.ref == record2.ref or record1.ref in set(record2.alts):
-                concordant_ref += 1
-            else:
-                discordant += 1
+            for sample in common_samples:
+                gt1 = record1.samples[sample]["GT"]
+                gt2 = record2.samples[sample]["GT"]
 
-            if record2.alts is not None and record1.alts is not None:
-                if set(record1.alts) == set(record2.alts) or record2.ref in set(
-                    record1.alts
-                ):
-                    concordant_alt += 1
+                if None in gt1 or None in gt2:
+                    sample_concordance[sample]["missing"] += 1
+                elif self.are_genotypes_concordant(gt1, gt2, ref_flipped):
+                    sample_concordance[sample]["concordant"] += 1
                 else:
-                    discordant += 1
-            else:
-                discordant += 1
+                    sample_concordance[sample]["discordant"] += 1
 
-            locus_details.append(
-                {
-                    "chrom": chrom,
-                    "pos": pos,
-                    "concordant_ref": concordant_ref,
-                    "concordant_alt": concordant_alt,
-                    "discordant": discordant,
-                }
-            )
+                    if self.debug:
+                        self.logger.debug(
+                            f"Discordant sample: {sample}, GT1: {gt1}, GT2: {gt2}, flipped: {ref_flipped}"
+                        )
 
-        return locus_details
+        sample_summary = pd.DataFrame(sample_concordance).T
 
-    def calculate_allele_frequencies(self, record):
-        """Calculate allele frequencies from genotype data in a VCF record.
+        tabdir = output_dir / "tables"
+        tabdir.mkdir(exist_ok=True, parents=True)
 
-        Args:
-            record (pysam.VariantRecord): A VCF record containing genotype information.
+        plotdir = output_dir / "plots"
+        plotdir.mkdir(exist_ok=True, parents=True)
 
-        Returns:
-            list: A list of allele frequencies corresponding to REF and each ALT.
-        """
-        total_alleles = 0
+        sample_summary["total"] = (
+            sample_summary["concordant"] + sample_summary["discordant"]
+        )
+        sample_summary["concordant_pct"] = (
+            sample_summary["concordant"] / sample_summary["total"]
+        ) * 100
+        sample_summary["discordant_pct"] = (
+            sample_summary["discordant"] / sample_summary["total"]
+        ) * 100
+        sample_summary["missing_pct"] = (
+            sample_summary["missing"]
+            / (sample_summary["total"] + sample_summary["missing"])
+        ) * 100
 
-        if record.alts is not None:
-            allele_counts = [0] * (len(record.alts) + 1)  # Include REF and all ALTs
-        else:
-            allele_counts = [0]
+        ssumfn = tabdir / f"{self.prefix}_sample_concordance_summary.csv"
+        sample_summary.to_csv(ssumfn, header=True, index=False)
 
-        for sample in record.samples.values():
-            gt = sample["GT"]
-            for allele in gt:
-                if allele is not None and allele >= 0:  # Valid allele index
-                    allele_counts[allele] += 1
-                    total_alleles += 1
+        concordant_mean = sample_summary["concordant_pct"].mean()
+        concordant_median = sample_summary["concordant_pct"].median()
+        concordant_std = sample_summary["concordant_pct"].std()
 
-        if total_alleles > 0:
-            return [count / total_alleles for count in allele_counts]
-        else:
-            return [0] * (
-                len(record.alts) + 1
-            )  # Return zero frequencies if no valid alleles
+        discordant_mean = sample_summary["discordant_pct"].mean()
+        discordant_median = sample_summary["discordant_pct"].median()
+        discordant_std = sample_summary["discordant_pct"].std()
 
-    def check_allele_flip(self, record1, record2):
-        """Determines if there is an allele flip between two VCF records using calculated allele frequencies.
+        missing_mean = sample_summary["missing_pct"].mean()
+        missing_median = sample_summary["missing_pct"].median()
+        missing_std = sample_summary["missing_pct"].std()
 
-        Args:
-            record1 (pysam.VariantRecord): The first VCF record.
-            record2 (pysam.VariantRecord): The second VCF record.
-
-        Returns:
-            bool: True if there is an allele flip, False otherwise.
-        """
-        af1 = self.calculate_allele_frequencies(record1)
-        af2 = self.calculate_allele_frequencies(record2)
-
-        # Sort alleles by frequency to compare
-        sorted_indices_1 = sorted(range(len(af1)), key=lambda x: af1[x], reverse=True)
-        sorted_indices_2 = sorted(range(len(af2)), key=lambda x: af2[x], reverse=True)
-
-        sorted_af1 = [record1.alleles[i] for i in sorted_indices_1]
-        sorted_af2 = [record2.alleles[i] for i in sorted_indices_2]
-
-        return sorted_af1 != sorted_af2
-
-    def plot_overall_discordance(self, locus_details, output_dir):
-        plt.figure(figsize=(12, 6))
-
-        # Dictionary to hold counts for each discordance category
-        discordance_counts = {
-            "No Discordance": 0,
-            "One Allele Discordant": 0,
-            "Both Alleles Discordant": 0,
+        summary_stats = {
+            "Concordant Mean": concordant_mean,
+            "Concordant Median": concordant_median,
+            "Concordant StdDev": concordant_std,
+            "Discordant Mean": discordant_mean,
+            "Discordant Median": discordant_median,
+            "Discordant StdDev": discordant_std,
+            "Missing Mean": missing_mean,
+            "Missing Median": missing_median,
+            "Missing StdDev": missing_std,
         }
 
-        # Analyze each locus detail to categorize discordance
-        for detail in locus_details:
-            # Check for the key 'discordant' to prevent KeyError
-            if "discordant" not in detail:
-                continue
+        ssfn = tabdir / f"{self.prefix}_concordance_summary_stats.csv"
+        pd.DataFrame(summary_stats, index=[0]).to_csv(ssfn, index=False)
 
-            # Ensure that discordance levels are processed correctly
-            if detail["discordant"] == 0:
-                discordance_counts["No Discordance"] += 1
-            elif detail["discordant"] == 1:
-                discordance_counts["One Allele Discordant"] += 1
-            elif (
-                detail["discordant"] >= 2
-            ):  # Clearly define condition for both alleles being discordant
-                discordance_counts["Both Alleles Discordant"] += 1
+        plt.figure(figsize=(10, 6))
 
-        # Prepare data for plotting
-        data_to_plot = pd.DataFrame(
-            list(discordance_counts.items()), columns=["Discordance Category", "Count"]
+        dfmelt = sample_summary.melt(
+            value_vars=["concordant_pct", "discordant_pct", "missing_pct"],
+            var_name="Variable",
+            value_name="Value",
+            id_vars=["total", "concordant", "discordant", "missing"],
         )
 
-        # Plotting
-        sns.barplot(
-            x="Discordance Category",
-            y="Count",
-            hue="Discordance Category",
-            data=data_to_plot,
-            palette="Set2",
-        )
-        plt.title("Counts of Allelic Discordance Rates", fontsize=18)
-        plt.xlabel("Discordance Category", fontsize=18)
-        plt.ylabel("Number of Loci", fontsize=18)
-        plt.xticks(fontsize=18)
-        plt.yticks(fontsize=18)
+        # Remove any with all missing data.
+        dfmelt = dfmelt.dropna(subset=["Value"], how="any")
 
-        # Save the plot
-        output_path = Path(output_dir)
-        output_path.mkdir(parents=True, exist_ok=True)  # Ensure the directory exists
-        plt.savefig(
-            output_path / "overall_discordance.png", dpi=300, bbox_inches="tight"
+        # Make the tick labels clearer.
+        dfmelt["Variable"] = dfmelt["Variable"].map(
+            {
+                "concordant_pct": "Concordant",
+                "missing_pct": "Missing",
+                "discordant_pct": "Discordant",
+            }
         )
-        plt.close()  # Close the plot to free memory
+
+        # Plot violin plots with boxplots overlaid.
+        sns.violinplot(
+            data=dfmelt,
+            x="Variable",
+            y="Value",
+            hue="Variable",
+            hue_order=["Concordant", "Discordant", "Missing"],
+            palette="turbo",
+            density_norm="count",
+            inner=None,
+            linewidth=0,
+            saturation=0.4,
+        )
+
+        sns.boxplot(
+            data=dfmelt,
+            x="Variable",
+            y="Value",
+            hue="Variable",
+            palette="turbo",
+            boxprops={"zorder": 2},
+            hue_order=["Concordant", "Discordant", "Missing"],
+            width=0.2,
+        )
+        plt.ylim([0, 110])
+        plt.title("Per-sample Concordance, Discordance, and Missing Data")
+        plt.xlabel("Genotype Agreement")
+        plt.ylabel("Percentage")
+
+        fn = f"{self.prefix}_concordance_discordance_boxplot.{self.plt_ft}"
+        pltfn = plotdir / fn
+        plt.savefig(pltfn, bbox_inches="tight", facecolor="white")
+        plt.close()
+
+        plt.figure(figsize=(10, 6))
+
+        sns.regplot(
+            data=sample_summary, x="discordant_pct", y="missing_pct", color="darkorchid"
+        )
+
+        dftmp = sample_summary[["discordant_pct", "missing_pct"]]
+        dftmp = dftmp.dropna(axis=0, how="any")
+
+        corr_coef, pval = pearsonr(x=dftmp["discordant_pct"], y=dftmp["missing_pct"])
+
+        pval = "P < 0.0001" if pval < 0.0001 else f"P = {round(pval, 2)}"
+        rval = round(corr_coef, 2)
+        plottext = f"R = {rval} ({pval})"
+
+        plt.annotate(plottext, xy=(0.85, 0.95), xycoords="axes fraction")
+        plt.ylim([0, 110])
+        plt.title("Regression between Discordance and Missing Data Percent")
+        plt.xlabel("Discordance (%)")
+        plt.ylabel("Sample-wise Missing Data (%)")
+
+        pltfn = plotdir / f"{self.prefix}_discordance_missing_regression.{self.plt_ft}"
+        plt.savefig(pltfn, bbox_inches="tight", facecolor="white")
+        plt.close()
+
+        self.logger.info("Successfully calculated concordances!")
+        self.logger.info(f"Saved final plot to: {str(pltfn)}")
 
     def replace_missing_genotypes(self, input_vcf_path, output_vcf_path):
         # Check if the input file is gzip-compressed based on its extension.
@@ -843,11 +1106,21 @@ def get_args():
         "will be created if it does not exist.",
     )
     parser.add_argument(
+        "--prefix", type=str, required=True, help="Prefix to use for output files."
+    )
+    parser.add_argument(
         "--radseq",
         type=str,
         required=True,
         help="Path to the input ddRADseq VCF file. This file should contain variant\n"
         "calling data from ddRADseq sequencing assays, formatted as a VCF file.",
+    )
+    parser.add_argument(
+        "--plot_filetype",
+        type=str,
+        required=False,
+        default="pdf",
+        help="Filetype to use with output plots. Supported options: 'pdf', 'png', 'jpg'. Untested with other matplotlib options. Default: 'pdf'.",
     )
     parser.add_argument(
         "--str2drop",
@@ -861,12 +1134,6 @@ def get_args():
     return parser.parse_args()
 
 
-# Ensure this script is the main program and not being imported
-if __name__ == "__main__":
-    args = get_args()
-    # The rest of the script would follow here, utilizing the parsed arguments
-
-
 if __name__ == "__main__":
     args = get_args()
 
@@ -874,12 +1141,21 @@ if __name__ == "__main__":
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    gtseq_output_vcf_path = output_dir / "gtseq_output.vcf"
-    subset_vcf_path = output_dir / "radseq_subset.vcf"
-    merged_vcf_path = output_dir / "merged_gtseq_radseq.tmp.vcf"
+    gtseq_output_vcf_fn = Path("gtseq_output.vcf")
+    subset_vcf_fn = Path("radseq_subset.vcf")
+    merged_vcf_fn = Path("merged_gtseq_radseq.tmp.vcf")
 
     # Initialize and process GTseq data
-    converter = GTseqToVCF(filepath=args.gtseq, str2drop=args.str2drop)
+    converter = GTseqToVCF(
+        filepath=args.gtseq,
+        output_dir=output_dir,
+        prefix=args.prefix,
+        plot_filetype=args.plot_filetype,
+        str2drop=args.str2drop,
+    )
+
+    converter.logger.info(f"Will save output files to: {str(output_dir)}")
+
     converter.load_data()
     converter.parse_sample_column()
     converter.calculate_ref_alt_alleles()
@@ -888,21 +1164,19 @@ if __name__ == "__main__":
     converter.format_genotype_data()
 
     # Write the GTseq VCF
-    converter.write_vcf(gtseq_output_vcf_path)
+    converter.write_vcf(gtseq_output_vcf_fn)
 
     # Sort by CHROM and POS and tabix index file (if not already indexed)
-    gtseq_output_vcf_path = converter.preprocess_vcf_files(gtseq_output_vcf_path)
+    gtseq_output_vcf_path = converter.preprocess_vcf_files(gtseq_output_vcf_fn)
 
     # Subset RADseq VCF based on GTseq loci, write it, and index it
-    converter.subset_vcf_by_locus_ids(
-        Path(args.radseq), output_filename=subset_vcf_path
-    )
+    converter.subset_vcf_by_locus_ids(Path(args.radseq), output_filename=subset_vcf_fn)
 
-    subset_vcf_path = converter.preprocess_vcf_files(subset_vcf_path)
+    subset_vcf_path = converter.preprocess_vcf_files(subset_vcf_fn)
 
     # Merge the GTseq VCF with the subsetted RADseq VCF
     merged_vcf_path = converter.merge_vcf_files_with_missing_data_handling(
-        subset_vcf_path, gtseq_output_vcf_path, merged_vcf_path
+        subset_vcf_path, gtseq_output_vcf_path, merged_vcf_fn
     )
 
     # Create the new filename by removing '.tmp' from the stem, then adding
@@ -911,11 +1185,22 @@ if __name__ == "__main__":
 
     # Use the .with_name() method to get the new path with corrected filename
     final_vcf_path = merged_vcf_path.with_name(new_vcf_filename)
+    final_vcf_dir = converter.output_dir / "merged_vcf"
+    final_vcf_dir.mkdir(exist_ok=True, parents=True)
+    final_vcf_path = final_vcf_dir / final_vcf_path.name
 
     converter.replace_missing_genotypes(merged_vcf_path, final_vcf_path)
-    converter.preprocess_vcf_files(final_vcf_path)
+    converter.preprocess_vcf_files(final_vcf_path, is_final_output=True)
 
     # Clean up temporary / intermediate files.
     for pth in output_dir.iterdir():
         if ".tmp" in pth.suffixes:
             pth.unlink()
+
+    if not final_vcf_path.exists() and not final_vcf_path.is_file():
+        msg = f"Output VCF file {final_vcf_path} could not be found. The program may have encountered an unknown error."
+        converter.logger.error(msg)
+        raise FileNotFoundError(msg)
+
+    converter.logger.info(f"The output VCF file is saved to: {final_vcf_path}")
+    converter.logger.info("Script execution completed successfully!")
