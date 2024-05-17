@@ -2,10 +2,10 @@ from setuptools import find_packages, setup
 
 setup(
     name="GTseq2VCF",
-    version="0.1.0",
+    version="1.0.0",
     author="Bradley T. Martin, Ph.D.",
     author_email="evobio721@gmail.com",
-    description="A tool to convert GTseq data to VCF format and merge with ddRADseq VCF file.",
+    description="A tool to convert GTseq data to VCF format and merge with an existing ddRADseq VCF file, keeping only the loci in the GT-seq panel.",
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
     url="https://github.com/btmartin721/GTseq2VCF",
@@ -15,6 +15,7 @@ setup(
         "matplotlib",
         "seaborn",
         "pysam",
+        "scipy",
     ],
     python_requires=">=3.11",
     entry_points={
@@ -28,8 +29,8 @@ setup(
         "Programming Language :: Python :: 3.13",
         "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
         "Operating System :: OS Independent",
-        "Development Status :: 4 - Beta",
+        "Development Status :: 5 - Production/Stable",
         "Topic :: Scientific/Engineering :: Bio-Informatics",
     ],
-    keywords="genomics GTseq VCF ddRADseq bioinformatics merge",
+    keywords="genomics,GTseq,GT-seq,VCF,panel,ddRAD,bioinformatics,merge,genetics,population genetics",
 )
