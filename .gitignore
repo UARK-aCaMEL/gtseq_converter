@@ -12,4 +12,5 @@ test.vcf
 *.png
 *.pdf
 analysis/
-
+*_final_test/
+*.pyc
