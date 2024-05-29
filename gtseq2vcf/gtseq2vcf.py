@@ -719,6 +719,13 @@ class GTseqToVCF:
         vcf_dir.mkdir(exist_ok=True, parents=True)
         outpth = vcf_dir / output_fn
 
+        # Calculate missing data percentages for each locus in both VCFs
+        self.calculate_missing_percentage_for_loci(vcf1_path)
+        self.calculate_missing_percentage_for_loci(vcf2_path)
+
+        self.calculate_overall_concordance(vcf1_path, vcf2_path,
+                                           self.output_dir)
+
         # Read in VCF files
         vcf1, vcf1_path = self.read_vcf(vcf1_path)
         vcf2, vcf2_path = self.read_vcf(vcf2_path)
