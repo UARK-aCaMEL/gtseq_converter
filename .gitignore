@@ -16,4 +16,5 @@ analysis/
 *.pyc
 no_elk_reruns_final/
 wtd_fixed_logfile.txt
-
+analysis2/
+*.zip

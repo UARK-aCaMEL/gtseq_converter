@@ -723,15 +723,13 @@ class GTseqToVCF:
         self.calculate_missing_percentage_for_loci(vcf1_path)
         self.calculate_missing_percentage_for_loci(vcf2_path)
 
-        self.calculate_overall_concordance(vcf1_path, vcf2_path,
-                                           self.output_dir)
+        self.calculate_overall_concordance(vcf1_path, vcf2_path, self.output_dir)
 
         # Read in VCF files
         vcf1, vcf1_path = self.read_vcf(vcf1_path)
         vcf2, vcf2_path = self.read_vcf(vcf2_path)
 
-        # Prepare output VCF with header from vcf1, including all samples from
-        # both files
+        # Prepare output VCF with header from vcf1, including all samples from both files
         combined_samples = sorted(set(vcf1.header.samples) | set(vcf2.header.samples))
 
         header = vcf1.header.copy()
@@ -747,20 +745,69 @@ class GTseqToVCF:
             locus_key = f"{record1.chrom}_{record1.pos}"
             record2 = vcf2_records.get(locus_key, None)
 
+            ref_flipped = False
+            ref_flipped2 = False
+
             if record2:
+                if record1.alts is None or record2.alts is None:
+                    if record1.alts is not None and record2.alts is None:
+                        record2.alts = record1.alts
+                    elif record2.alts is not None and record1.alts is None:
+                        record1.alts = record2.alts
+                    elif record2.alts is None and record1.alts is None:
+                        self.logger.warning(f"Monomorphic locus detected: {locus_key}")
+                    else:
+                        self.logger.warning(
+                            f"Unknown issue occurred at locus: {locus_key}"
+                        )
+
                 # Check if ref/alt alleles are the same
                 if record1.ref == record2.ref and record1.alts == record2.alts:
                     ref_flipped = False
+
                 elif self.check_allele_flip(record1, record2):
                     ref_flipped = True
-                    # Flip the alleles in record2 if ref and alt alleles are flipped
+                    # Flip the alleles in record2 if ref and alt alleles are
+                    # flipped
                     record2.ref, record2.alts = record2.alts[0], (record2.ref,)
+
+                elif self.check_allele_flip(record2, record1):
+                    ref_flipped = False
+                    ref_flipped2 = True
+                    # Flip the alleles in record1 if ref and alt alleles are
+                    # flipped
+                    record1.ref, record1.alts = record1.alts[0], (record1.ref,)
+
+                # Catch edge cases.
+                elif (
+                    record2.alts
+                    and record1.ref == record2.alts[0]
+                    and record1.alts[0] == record2.ref
+                ):
+                    record1.ref = record1.alts[0]
+                    record1.alts = (record1.ref,)
+                    ref_flipped2 = True
+
+                elif (
+                    record1.alts
+                    and record2.ref == record1.alts[0]
+                    or record2.alts[0] == record1.ref
+                ):
+                    record2.ref = record2.alts[0]
+                    record2.alts = (record2.ref,)
+                    ref_flipped2 = True
+
                 else:
-                    self.logger.warning(f"Ref/Alt alleles do not match for locus {locus_key}")
-                    # Optionally handle the case where alleles do not match and cannot be flipped
+                    self.logger.debug(f"record1.ref: {record1.ref}")
+                    self.logger.debug(f"record1.alts: {record1.alts}")
+                    self.logger.debug(f"record2.ref: {record2.ref}")
+                    self.logger.debug(f"record2.alts: {record2.alts}")
+
+                    self.logger.warning(
+                        f"Unable to resolve ref/alt allele flip for locus "
+                        f"{locus_key}."
+                    )
                     continue
-            else:
-                ref_flipped = False
 
             new_record = output_vcf.new_record()
             new_record.chrom = record1.chrom
@@ -805,6 +852,11 @@ class GTseqToVCF:
                         1 - allele if allele is not None else allele for allele in gt2
                     )
 
+                if ref_flipped2:
+                    gt1 = tuple(
+                        1 - allele if allele is not None else allele for allele in gt1
+                    )
+
                 # Determine which genotype to use based on precedence
                 if prefer_vcf1:
                     chosen_gt = gt1 if gt1 != (None, None) else gt2
@@ -812,7 +864,10 @@ class GTseqToVCF:
                     chosen_gt = gt2 if gt2 != (None, None) else gt1
 
                 # Apply the chosen genotype
-                if chosen_gt != (None, None):  # Avoid setting explicitly missing genotypes if not necessary
+                if chosen_gt != (
+                    None,
+                    None,
+                ):  # Avoid setting explicitly missing genotypes if not necessary
                     new_record.samples[sample]["GT"] = chosen_gt
                 else:
                     # Handle explicitly missing data if needed (e.g., set to './.' or leave as default missing)
@@ -827,139 +882,6 @@ class GTseqToVCF:
 
         # Tabix index and sort output vcf file.
         return self.preprocess_vcf_files(outpth.name)
-
-
-    def merge_vcf_files_with_missing_data_handling(
-        self, vcf1_path, vcf2_path, output_fn
-    ):
-        """
-        Merge two VCF files by choosing for each locus the genotypes from the file with the least missing data. If a sample is only present in one file, its genotype is still included.
-
-        Args:
-            vcf1_path (pathlib.Path): Path to the first VCF file.
-            vcf2_path (pathlib.Path): Path to the second VCF file.
-            output_fn (pathlib.Path): Filename of the output VCF file. Will have ".gz" appended as extension if not already present, and will be sorted, compressed, and indexed.
-        """
-        self.logger.info("Merging VCF and GT-seq data...")
-
-        vcf_dir = self.output_dir / "vcfs"
-        vcf_dir.mkdir(exist_ok=True, parents=True)
-        outpth = vcf_dir / output_fn
-
-        # Calculate missing data percentages for each locus in both VCFs
-        vcf1_missing = self.calculate_missing_percentage_for_loci(vcf1_path)
-        vcf2_missing = self.calculate_missing_percentage_for_loci(vcf2_path)
-
-        self.calculate_overall_concordance(vcf1_path, vcf2_path, self.output_dir)
-
-        # Read in VCF files
-        vcf1, vcf1_path = self.read_vcf(vcf1_path)
-        vcf2, vcf2_path = self.read_vcf(vcf2_path)
-
-        # Prepare output VCF with header from vcf1, including all samples from
-        # both files
-        combined_samples = sorted(set(vcf1.header.samples) | set(vcf2.header.samples))
-
-        header = vcf1.header.copy()
-        for sample in combined_samples:
-            if sample not in vcf1.header.samples:
-                header.add_sample(sample)
-        output_vcf = pysam.VariantFile(outpth, "w", header=header)
-
-        # Cache vcf2 records for efficiency
-        vcf2_records = {f"{rec.chrom}_{rec.pos}": rec for rec in vcf2.fetch()}
-
-        for record1 in vcf1.fetch():
-            locus_key = f"{record1.chrom}_{record1.pos}"
-            record2 = vcf2_records.get(locus_key, None)
-
-            if record2:
-                # Check if ref/alt alleles are the same
-                if record1.ref == record2.ref and record1.alts == record2.alts:
-                    ref_flipped = False
-                elif self.check_allele_flip(record1, record2):
-                    ref_flipped = True
-                    # Flip the alleles in record2 if ref and alt alleles are flipped
-                    record2.ref, record2.alts = record2.alts[0], (record2.ref,)
-                else:
-                    self.logger.warning(f"Ref/Alt alleles do not match for locus {locus_key}")
-                    # Optionally handle the case where alleles do not match and cannot be flipped
-                    continue
-            else:
-                ref_flipped = False
-
-            new_record = output_vcf.new_record()
-            new_record.chrom = record1.chrom
-            new_record.pos = record1.pos
-            new_record.ref = record1.ref
-            new_record.id = record1.id
-            new_record.alts = record1.alts
-            new_record.qual = record1.qual
-
-            # Setting FILTER and INFO fields from the chosen record (prioritize record1 if equal or no record2)
-            if record2 and vcf2_missing.get(locus_key, 0) < vcf1_missing.get(
-                locus_key, float("inf")
-            ):
-                for filter_key in record2.filter.keys():
-                    new_record.filter.add(filter_key)
-                for key, value in record2.info.items():
-                    new_record.info[key] = value
-            else:
-                for filter_key in record1.filter.keys():
-                    new_record.filter.add(filter_key)
-                for key, value in record1.info.items():
-                    new_record.info[key] = value
-
-            for sample in combined_samples:
-                gt1 = (None, None)
-                if sample in record1.header.samples:
-                    gt1 = (
-                        record1.samples[sample]["GT"]
-                        if record1.samples[sample]["GT"] != (None, None)
-                        else (None, None)
-                    )
-
-                gt2 = (None, None)
-                if record2 and sample in record2.header.samples:
-                    gt2 = (
-                        record2.samples[sample]["GT"]
-                        if record2.samples[sample]["GT"] != (None, None)
-                        else (None, None)
-                    )
-
-                # Adjust genotypes if necessary
-                if ref_flipped:
-                    gt2 = tuple(
-                        1 - allele if allele is not None else allele for allele in gt2
-                    )
-
-                # Determine which genotype to use based on missing data
-                if not record2 or (
-                    gt1 != (None, None)
-                    and vcf1_missing.get(locus_key, 0)
-                    <= vcf2_missing.get(locus_key, float("inf"))
-                ):
-                    chosen_gt = gt1
-                else:
-                    chosen_gt = gt2 if gt2 != (None, None) else gt1
-
-                # Apply the chosen genotype
-                if chosen_gt != (None, None):  # Avoid setting explicitly missing genotypes if not necessary
-                    new_record.samples[sample]["GT"] = chosen_gt
-                else:
-                    # Handle explicitly missing data if needed (e.g., set to './.' or leave as default missing)
-                    pass
-
-            # Write the new record after setting all sample genotypes
-            output_vcf.write(new_record)
-
-        output_vcf.close()
-
-        self.logger.info("Successfully merged VCF and GT-seq data!")
-
-        # Tabix index and sort output vcf file.
-        return self.preprocess_vcf_files(outpth.name)
-
 
     def find_shared_loci(self, vcf1_path, vcf2_path):
 
@@ -1280,7 +1202,7 @@ def get_args():
     return parser.parse_args()
 
 
-if __name__ == "__main__":
+def main():
     args = get_args()
 
     # Directory and file setup
@@ -1320,13 +1242,8 @@ if __name__ == "__main__":
 
     subset_vcf_path = converter.preprocess_vcf_files(subset_vcf_fn)
 
-    # Merge the GTseq VCF with the subsetted RADseq VCF
-    # merged_vcf_path = converter.merge_vcf_files_with_missing_data_handling(
-    #     subset_vcf_path, gtseq_output_vcf_path, merged_vcf_fn
-    # )
     merged_vcf_path = converter.merge_vcf_files_with_precedence(
-        subset_vcf_path, gtseq_output_vcf_path, merged_vcf_fn, 
-        prefer_vcf1=False
+        subset_vcf_path, gtseq_output_vcf_path, merged_vcf_fn, prefer_vcf1=False
     )
 
     # Create the new filename by removing '.tmp' from the stem, then adding
@@ -1354,3 +1271,7 @@ if __name__ == "__main__":
 
     converter.logger.info(f"The output VCF file is saved to: {final_vcf_path}")
     converter.logger.info("Script execution completed successfully!")
+
+
+if __name__ == "__main__":
+    main()
