@@ -1,65 +1,67 @@
+```markdown
 # GTSeq2VCF
 
-A tool to convert GTseq CSV data to VCF format and merge with an existing ddRADseq VCF file. Only the loci present in the GT-seq panel are retained, and duplicate samples that overlap are reduced to the duplicate with the least missing genotypes.  
-
-Some nice visualizations and tables are generated. The tables are standard CSV files and can be easily re-loaded into Python or R if desired.
+A command-line tool to convert GTseq CSV data into VCF format and optionally merge with an existing ddRADseq VCF. Only the loci present in the GT-seq panel are retained, and duplicate samples that overlap are reduced to the duplicate with the fewest missing genotypes.
 
 ## Installation
 
-Navigate to the project's parent directory, and enter the command:
+Install from the project root using pip:
 
-```pip install .```
+```
 
-Eventually, we will upload this package to PyPi so that it can be installed easier, but for now, just install as above. It will install all necessary Python dependencies as well as the package.  
+pip install .
+
+```
+
+This will install all required Python dependencies along with the `gtseq2vcf` package.
 
 ## Usage
 
-You can see the usage by typing:
-
-```python gtseq2vcf/gtseq2vcf.py -h```
-
-### Command-line Script Arguments
-
-There are several required options:
-
-1. --gtseq - Path to the GT-seq CSV file, as returned from the core facilty.  
-2. --radseq - Path to the VCF file to merge the GT-seq data with. Should contain only SNP data.
-3. --output_dir - Path to the output directory where outputs will be saved.  
-4. --prefix - String denoting the prefix to use for all output files.  
-
-There are also two optional argument:  
-
-+ --str2drop - Patterns of loci to remove from GT-seq data before merging with VCF file. This allows us to remove loci that do not contain numeric position information. The pattern can be any portion of a string contained within the locus names (header line of the GT-seq CSV file), and any loci names containing the pattern are removed before the merge. Finally, if you want to use multiple patterns, just separate the patterns by a space on the command-line. No need to use quotation marks surrounding the strings.  
-
-+ --plot_filetype - Filetype to use for plots. Defaults to "pdf", but you can also use "png" or "jpg" instead if you would like to. The plots are then saved to the specified format. Technically you can use any file type supported by matplotlib, but to-date, we have only tested the "pdf", "png", and "jpg" options.  
-
-### Excluding Loci with Patterns
-
-To exclude GT-Seq loci using a pattern, you just need to specify the ```--str2drop``` argument when running the script, followed by any number of patterns to exclude, separated by a space (no quotes surrounding). For example:  
+Print the help message:
 
 ```
-python gtseq2vcf/gtseq2vcf.py --gtseq data/my_gtseq_data.csv --radseq data/my_radseq_data.vcf.gz --output_dir analysis --prefix test --str2drop Ovi_ _PRNP_
+
+python gtseq2vcf/gtseq2vcf.py -h
+
 ```
 
-**NOTE**: If you get an error that says the "POS" index contains non-numeric values, you probably need to specify loci to remove that do not conform to the standard pattern in the GT-seq CSV file header using the ```--str2drop``` option. Here is an example of how to use it:  
+### Required Arguments
 
-```--str2drop locus_pattern1 locus_pattern2 ...```   
+- `--gtseq` : Path to the GT-seq CSV file (as returned by the core facility).
+- `--output_dir` : Directory where output files will be saved.
+- `--prefix` : Prefix string for all output filenames.
 
-In the ```--str2drop``` option, patterns contained with the offending locus names can be used, and the strings do not have to be the entire locus name. If there is more than one locus to remove by pattern, then you can separate them with a space on the command-line, as in the above code block example.  
+### Optional Arguments
 
-## What does the script do?
+- `--radseq` : Path to an existing ddRADseq VCF file to merge with the GTseq-derived VCF.
+- `--str2drop` : One or more string patterns; any locus names containing these patterns will be excluded before conversion. Provide multiple patterns separated by spaces without quotes.
 
-The script takes two VCF files as input:  
+### Example
 
-1. VCF file derived from double digest RAD sequencing (ddRADseq) or RAD sequencing (RADseq). The VCF file is expected to have been generated with ipyrad, but other formats *might* work.   
+Exclude non-standard loci by pattern and merge with a ddRADseq VCF:
 
-2. CSV (comma-delimited) file derived from GT-Seq panel.  
+```
 
-The script then merges the two VCF files on the GT-Seq panel's loci and combines the samples from the two VCF files. If there are overlapping samples (duplicates), it keeps only the sample with the least missing genotypes.   
+python gtseq2vcf/gtseq2vcf.py&#x20;
+\--gtseq data/my\_gtseq\_data.csv&#x20;
+\--radseq data/my\_radseq.vcf.gz&#x20;
+\--output\_dir results&#x20;
+\--prefix analysis1&#x20;
+\--str2drop Ovi\_ *PRNP*
 
-You need to specify an output directory for the merged output files to be written to, and also it will make a nice visualization of per-sample concordance, discordance, and missing data percentages. It also saves all the data to CSV files, which can be found in the ```<output_dir>/tables``` directory.    
+```
 
-Visualizations can be found in the ```<output_dir>/plots``` directory, and the final, merged output can be found in the ```<output_dir>/merged_vcf``` directory. Intermediate VCF files can be found in ```<output_dir>/vcfs```.  
+## Functionality
 
-Finally, you must specify a prefix with the ```--prefix <my_prefix>``` option. This allows you to save outputs from multiple analyses into one output directory.  
+1. **GTseq CSV → VCF**  
+   Converts GT-seq genotype CSV into a standard VCFv4.2 file, inferring reference and alternate alleles and encoding genotypes appropriately.
 
+2. **Optional RADseq Merge**  
+   If a RADseq VCF is provided, retains only panel loci, subsets the RADseq VCF, and merges samples. In cases of duplicate sample IDs, the sample with the fewest missing genotypes is kept.
+
+3. **Output Structure**  
+   - `<output_dir>/vcfs`: Contains generated and intermediate VCF files.  
+   - `<output_dir>/merged_vcf`: Contains the final merged VCF if `--radseq` is used.  
+
+Use the prefix to organize multiple analyses within the same output directory.
+```
