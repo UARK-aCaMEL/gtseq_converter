@@ -2,7 +2,7 @@ from setuptools import find_packages, setup
 
 setup(
     name="GTseq2VCF",
-    version="1.0.1",
+    version="1.1.0",
     author="Bradley T. Martin, Ph.D.",
     author_email="evobio721@gmail.com",
     description="A tool to convert GTseq data to VCF format and merge with an existing ddRADseq VCF file, keeping only the loci in the GT-seq panel.",
