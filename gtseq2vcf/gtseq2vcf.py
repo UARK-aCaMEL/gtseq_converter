@@ -31,10 +31,22 @@ class GTseqToVCF:
     def load_and_parse(self):
         self.logger.info(f"Loading GTseq CSV: {self.csv_file}")
         df = pd.read_csv(self.csv_file)
-        # drop metadata columns
-        meta_cols = ["Raw Reads", "On-Target Reads", "%On-Target", "%GT", "IFI"]
-        df.drop(columns=[c for c in meta_cols if c in df.columns], inplace=True, errors='ignore')
-        # drop unwanted patterns
+
+        # Drop known metadata columns if present
+        meta_cols = [
+            "Total Genotypes",
+            "Total Missing",
+            "%missing",
+            "Raw Reads",
+            "On-Target Reads",
+            "%On-Target",
+            "%GT",
+            "IFI",
+        ]
+        df.drop(columns=[c for c in meta_cols if c in df.columns],
+                inplace=True, errors='ignore')
+
+        # Drop unwanted patterns
         for p in self.drop_patterns:
             df = df.loc[:, ~df.columns.str.contains(p, case=False)]
         df.columns = df.columns.str.strip()
