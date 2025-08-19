@@ -145,13 +145,20 @@ class GTseqToVCF:
         final = Path(f"{self.prefix}.vcf.gz")
         self.logger.info(f"Merging with RADseq {self.radseq_file} -> {final}")
 
-        # --- NEW: prune RADseq samples that duplicate GTseq samples (keep GTseq) ---
-        # If there is any overlap in sample names, drop those from RADseq before merging.
+        # NEW: Only exclude overlapping samples (intersection of RADseq header and GTseq sample names)
+        rad_for_merge = self.radseq_file
         pruned_rad = Path(f"{self.prefix}.radseq_pruned.vcf.gz")
-        if self.samples:
-            exclude_list = ",".join(self.samples)  # names to exclude from RADseq
-            self.logger.info(f"Pruning {self.radseq_file} to drop {len(self.samples)} GTseq samples if present.")
-            # bcftools view -s ^S1,S2,... keeps all samples except listed
+
+        # Read RADseq samples from header
+        vcf_rad = pysam.VariantFile(str(self.radseq_file))
+        rad_names = set(map(str, vcf_rad.header.samples))
+        gt_names = set(self.samples)
+        overlap = sorted(rad_names & gt_names)
+
+        if overlap:
+            self.logger.info(f"Pruning RADseq: excluding {len(overlap)} overlapping samples (keeping GTseq versions).")
+            # bcftools view -s ^A,B,C  => keep all samples except A,B,C
+            exclude_list = ",".join(overlap)
             subprocess.run([
                 'bcftools', 'view', '-s', f'^{exclude_list}', '-Oz',
                 '-o', str(pruned_rad), str(self.radseq_file)
@@ -159,7 +166,7 @@ class GTseqToVCF:
             subprocess.run(['tabix', '-p', 'vcf', str(pruned_rad)], check=True)
             rad_for_merge = pruned_rad
         else:
-            rad_for_merge = self.radseq_file
+            self.logger.info("No overlapping samples between RADseq and GTseq; skipping pruning.")
 
         subprocess.run([
             'bcftools', 'merge', '-m', 'all', '-O', 'z',
@@ -168,7 +175,7 @@ class GTseqToVCF:
         subprocess.run(['tabix', '-p', 'vcf', str(final)], check=True)
 
         # Clean up pruned RAD if created
-        if pruned_rad.exists():
+        if rad_for_merge == pruned_rad and pruned_rad.exists():
             pruned_rad.unlink()
             pruned_tbi = pruned_rad.with_suffix(pruned_rad.suffix + '.tbi')
             if pruned_tbi.exists():
