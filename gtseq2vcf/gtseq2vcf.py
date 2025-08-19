@@ -144,11 +144,36 @@ class GTseqToVCF:
     def merge_with_radseq(self, tmp_vcf):
         final = Path(f"{self.prefix}.vcf.gz")
         self.logger.info(f"Merging with RADseq {self.radseq_file} -> {final}")
+
+        # --- NEW: prune RADseq samples that duplicate GTseq samples (keep GTseq) ---
+        # If there is any overlap in sample names, drop those from RADseq before merging.
+        pruned_rad = Path(f"{self.prefix}.radseq_pruned.vcf.gz")
+        if self.samples:
+            exclude_list = ",".join(self.samples)  # names to exclude from RADseq
+            self.logger.info(f"Pruning {self.radseq_file} to drop {len(self.samples)} GTseq samples if present.")
+            # bcftools view -s ^S1,S2,... keeps all samples except listed
+            subprocess.run([
+                'bcftools', 'view', '-s', f'^{exclude_list}', '-Oz',
+                '-o', str(pruned_rad), str(self.radseq_file)
+            ], check=True)
+            subprocess.run(['tabix', '-p', 'vcf', str(pruned_rad)], check=True)
+            rad_for_merge = pruned_rad
+        else:
+            rad_for_merge = self.radseq_file
+
         subprocess.run([
             'bcftools', 'merge', '-m', 'all', '-O', 'z',
-            str(self.radseq_file), str(tmp_vcf), '-o', str(final)
+            str(rad_for_merge), str(tmp_vcf), '-o', str(final)
         ], check=True)
         subprocess.run(['tabix', '-p', 'vcf', str(final)], check=True)
+
+        # Clean up pruned RAD if created
+        if pruned_rad.exists():
+            pruned_rad.unlink()
+            pruned_tbi = pruned_rad.with_suffix(pruned_rad.suffix + '.tbi')
+            if pruned_tbi.exists():
+                pruned_tbi.unlink()
+
         tmp_vcf.unlink()
         return final
 
