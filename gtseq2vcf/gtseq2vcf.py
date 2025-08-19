@@ -61,7 +61,9 @@ class GTseqToVCF:
                 self.logger.info(f"Found {len(idxs)} duplicate columns for sample '{name}': {idxs}")
                 best_idx, best_count = idxs[0], -1
                 for i in idxs:
-                    count = df2.iloc[:, i].apply(lambda g: any(ch not in {'-', 'N', '0'} for ch in str(g))).sum()
+                    count = df2.iloc[:, i].apply(
+                        lambda g: any(ch not in {'-', 'N', '0', '00'} for ch in str(g))
+                    ).sum()
                     self.logger.info(f"  Column {i} has {count} non-missing genotypes")
                     if count > best_count:
                         best_count, best_idx = count, i
@@ -78,7 +80,7 @@ class GTseqToVCF:
         from collections import Counter
         refs, alts = {}, {}
         for snpid in self.snps:
-            bases = [b for gt in df2.loc[snpid, self.samples] for b in gt if b not in {'-', 'N', '0'}]
+            bases = [b for gt in df2.loc[snpid, self.samples] for b in gt if b not in {'-', 'N', '0', '00'}]
             cnt = Counter(bases)
             refs[snpid] = cnt.most_common(1)[0][0] if cnt else '.'
             alts[snpid] = cnt.most_common(2)[1][0] if len(cnt) > 1 else '.'
